@@ -120,6 +120,7 @@ jobs:
           make -j2
           test -s sys-agent/sys-agent.nsp
           test -s sys-agent/43000000000000A6/exefs.nsp
+          # Keep strict -Werror host tests; agent branch fixes the 100-byte test fixture.
           make test
           ls -lh sys-agent/sys-agent.nsp
 
