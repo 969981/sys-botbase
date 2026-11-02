@@ -141,7 +141,8 @@ static void testDepthCap(void)
 
 static void testTooLongReportsTheOffendingToken(void)
 {
-    char sequence[512];
+    /* The fixture is exactly 100 bytes plus its terminating NUL. */
+    char sequence[101];
     SequenceExpandInfo info;
 
     /* 64 KiB cannot hold 1000 tokens of 100 bytes each. */
