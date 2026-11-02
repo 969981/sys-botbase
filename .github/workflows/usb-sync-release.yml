@@ -1,0 +1,171 @@
+name: Sync USB-Botbase upstream, build and release
+
+on:
+  schedule:
+    # Every 10 minutes (UTC); GitHub may delay scheduled runs.
+    - cron: '3,13,23,33,43,53 * * * *'
+  workflow_dispatch:
+  push:
+    branches: [master]
+    paths:
+      - .github/workflows/usb-sync-release.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: usb-botbase-upstream-release
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Initialize or merge Koi upstream into usb
+    runs-on: ubuntu-latest
+    outputs:
+      publish: ${{ steps.check.outputs.publish }}
+      upstream_sha: ${{ steps.sync.outputs.upstream_sha }}
+      head_sha: ${{ steps.sync.outputs.head_sha }}
+      tag: ${{ steps.sync.outputs.tag }}
+    steps:
+      - name: Checkout default branch (workflow controller)
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Create or synchronize usb branch
+        id: sync
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add usb-upstream https://github.com/Koi-3088/USB-Botbase.git
+          git fetch --no-tags usb-upstream master
+          upstream_sha="$(git rev-parse FETCH_HEAD)"
+
+          if git ls-remote --exit-code origin refs/heads/usb >/dev/null 2>&1; then
+            git fetch --no-tags origin refs/heads/usb:refs/remotes/origin/usb
+            git switch -C usb refs/remotes/origin/usb
+            if git merge-base --is-ancestor "$upstream_sha" HEAD; then
+              echo "usb branch already contains Koi upstream $upstream_sha"
+            else
+              # Preserve independent usb changes. Conflicts fail instead of force-pushing.
+              git merge --no-edit "$upstream_sha"
+              git push origin HEAD:refs/heads/usb
+            fi
+            head_sha="$(git rev-parse HEAD)"
+          else
+            # Bootstrap from upstream's actual Git history, not from sys-botbase master.
+            git push origin "$upstream_sha":refs/heads/usb
+            head_sha="$upstream_sha"
+          fi
+
+          tag="usb-${upstream_sha:0:12}"
+          echo "upstream_sha=$upstream_sha" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Synchronized usb branch to $head_sha (upstream $upstream_sha)"
+
+      - name: Check for existing USB release
+        id: check
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.sync.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Existing release $RELEASE_TAG; nothing new to publish."
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Missing release $RELEASE_TAG; compiling USB-Botbase."
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build-release:
+    name: Build USB-Botbase for Switch and publish
+    needs: sync
+    if: needs.sync.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    container:
+      image: devkitpro/devkita64:20260219
+    steps:
+      - name: Checkout synchronized USB source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.head_sha }}
+          fetch-depth: 1
+
+      - name: Validate USB commit
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ needs.sync.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          test -f sys-botbase/Makefile
+          test -f sys-botbase/source/main.c
+
+      - name: Compile with devkitPro
+        shell: bash
+        run: |
+          set -euo pipefail
+          make -j2
+          test -s sys-botbase/sys-botbase.nsp
+          ls -lh sys-botbase/sys-botbase.nsp
+
+      - name: Package Atmosphere install ZIP (USB mode)
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.sync.outputs.tag }}
+        run: |
+          set -euo pipefail
+          module_dir="release/package/atmosphere/contents/430000000000000B"
+          mkdir -p "$module_dir/flags" release/assets
+          cp sys-botbase/sys-botbase.nsp "$module_dir/exefs.nsp"
+          cp toolbox.json "$module_dir/toolbox.json"
+          printf 'usb\n' > "$module_dir/config.cfg"
+          touch "$module_dir/flags/boot2.flag"
+          cp sys-botbase/sys-botbase.nsp release/assets/usb-botbase.nsp
+          (cd release/package && zip -q -r "../assets/usb-botbase-${RELEASE_TAG}.zip" atmosphere)
+          unzip -l "release/assets/usb-botbase-${RELEASE_TAG}.zip"
+          sha256sum release/assets/*.nsp release/assets/*.zip > release/assets/SHA256SUMS
+
+      - name: Upload CI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: usb-botbase-${{ needs.sync.outputs.tag }}
+          path: release/assets/*
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish versioned USB release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.sync.outputs.tag }}
+          target_commitish: ${{ needs.sync.outputs.head_sha }}
+          name: USB-Botbase (${{ needs.sync.outputs.tag }})
+          draft: false
+          prerelease: false
+          generate_release_notes: false
+          body: |
+            Automated build from [Koi-3088/USB-Botbase](https://github.com/Koi-3088/USB-Botbase) master.
+            Source branch in this repository: [usb](https://github.com/969981/sys-botbase/tree/usb).
+            Upstream commit: `${{ needs.sync.outputs.upstream_sha }}`
+            Synchronized local commit: `${{ needs.sync.outputs.head_sha }}`
+
+            Install: extract the ZIP at the root of your Switch SD card and reboot.
+            Includes `atmosphere/contents/430000000000000B/exefs.nsp`, `flags/boot2.flag`,
+            `toolbox.json`, and `config.cfg` (USB mode).
+            Change `config.cfg` to `wifi` for sockets mode.
+
+            **Important:** USB-Botbase and sys-botbase share the same sysmodule title ID.
+            Install one version at a time. This is an unofficial automated build.
+          files: |
+            release/assets/usb-botbase.nsp
+            release/assets/usb-botbase-*.zip
+            release/assets/SHA256SUMS
+          fail_on_unmatched_files: true
