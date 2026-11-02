@@ -91,6 +91,9 @@ jobs:
           EXPECTED_HEAD: ${{ needs.sync.outputs.head_sha }}
         run: |
           set -euo pipefail
+          # The devkitPro container runs as root while checkout files belong to the runner.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          echo "Checked out: $(git rev-parse HEAD); expected: $EXPECTED_HEAD"
           test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
 
       - name: Build sys-botbase using devkitPro
@@ -137,12 +140,12 @@ jobs:
           generate_release_notes: false
           body: |
             Automated source build from [olliz0r/sys-botbase](https://github.com/olliz0r/sys-botbase).
-            Upstream master commit: \`${{ needs.sync.outputs.upstream_sha }}\`
-            Local synchronized commit: \`${{ needs.sync.outputs.head_sha }}\`
+            Upstream master commit: `${{ needs.sync.outputs.upstream_sha }}`
+            Local synchronized commit: `${{ needs.sync.outputs.head_sha }}`
 
             Download the ZIP and extract it to the root of the Switch SD card, then reboot.
-            The ZIP installs \`atmosphere/contents/430000000000000B/exefs.nsp\`,
-            \`flags/boot2.flag\`, and \`toolbox.json\`.
+            The ZIP installs `atmosphere/contents/430000000000000B/exefs.nsp`,
+            `flags/boot2.flag`, and `toolbox.json`.
             This is an automated build, not an upstream official release.
           files: |
             release/assets/sys-botbase.nsp
