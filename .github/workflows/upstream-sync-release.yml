@@ -1,0 +1,151 @@
+name: Sync upstream, build and release
+
+on:
+  schedule:
+    # Every six hours (UTC); scheduled runs may be delayed by GitHub.
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+  push:
+    branches: [master]
+    paths:
+      - .github/workflows/upstream-sync-release.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sys-botbase-upstream-release
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Merge upstream master (no force push)
+    runs-on: ubuntu-latest
+    outputs:
+      publish: ${{ steps.check.outputs.publish }}
+      tag: ${{ steps.check.outputs.tag }}
+      upstream_sha: ${{ steps.check.outputs.upstream_sha }}
+      head_sha: ${{ steps.check.outputs.head_sha }}
+    steps:
+      - name: Checkout local master with full history
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Fetch upstream and merge safely
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/olliz0r/sys-botbase.git
+          git fetch --no-tags upstream master
+          if git merge-base --is-ancestor FETCH_HEAD HEAD; then
+            echo "Already contains upstream master."
+          else
+            # Do not force push or silently resolve merge conflicts.
+            git merge --no-edit FETCH_HEAD
+            git push origin HEAD:master
+          fi
+
+      - name: Avoid duplicate releases
+        id: check
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          upstream_sha="$(git rev-parse FETCH_HEAD)"
+          head_sha="$(git rev-parse HEAD)"
+          tag="upstream-${upstream_sha:0:12}"
+          echo "upstream_sha=$upstream_sha" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $tag already exists; skipping build."
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "No release for $tag; build is required."
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build-release:
+    name: Build Switch sysmodule and publish release
+    needs: sync
+    if: needs.sync.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    container:
+      image: devkitpro/devkita64:20260219
+    steps:
+      - name: Checkout updated master
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 1
+
+      - name: Confirm synchronized revision
+        shell: bash
+        env:
+          EXPECTED_HEAD: ${{ needs.sync.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+
+      - name: Build sys-botbase using devkitPro
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "DEVKITPRO=$DEVKITPRO"
+          make -j2
+          test -s sys-botbase/sys-botbase.nsp
+          ls -lh sys-botbase/sys-botbase.nsp
+
+      - name: Assemble Atmosphere SD-card installation ZIP
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.sync.outputs.tag }}
+        run: |
+          set -euo pipefail
+          module_dir="release/package/atmosphere/contents/430000000000000B"
+          mkdir -p "$module_dir/flags" release/assets
+          cp sys-botbase/sys-botbase.nsp "$module_dir/exefs.nsp"
+          cp toolbox.json "$module_dir/toolbox.json"
+          touch "$module_dir/flags/boot2.flag"
+          cp sys-botbase/sys-botbase.nsp "release/assets/sys-botbase.nsp"
+          (cd release/package && zip -q -r "../assets/sys-botbase-${RELEASE_TAG}.zip" atmosphere)
+          unzip -l "release/assets/sys-botbase-${RELEASE_TAG}.zip"
+          sha256sum release/assets/* | tee release/assets/SHA256SUMS
+
+      - name: Upload CI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sys-botbase-${{ needs.sync.outputs.tag }}
+          path: release/assets/*
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.sync.outputs.tag }}
+          target_commitish: ${{ needs.sync.outputs.head_sha }}
+          name: sys-botbase (${{ needs.sync.outputs.tag }})
+          draft: false
+          prerelease: false
+          generate_release_notes: false
+          body: |
+            Automated source build from [olliz0r/sys-botbase](https://github.com/olliz0r/sys-botbase).
+            Upstream master commit: \`${{ needs.sync.outputs.upstream_sha }}\`
+            Local synchronized commit: \`${{ needs.sync.outputs.head_sha }}\`
+
+            Download the ZIP and extract it to the root of the Switch SD card, then reboot.
+            The ZIP installs \`atmosphere/contents/430000000000000B/exefs.nsp\`,
+            \`flags/boot2.flag\`, and \`toolbox.json\`.
+            This is an automated build, not an upstream official release.
+          files: |
+            release/assets/sys-botbase.nsp
+            release/assets/sys-botbase-*.zip
+            release/assets/SHA256SUMS
+          fail_on_unmatched_files: true
