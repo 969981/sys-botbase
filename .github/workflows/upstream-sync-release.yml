@@ -2,8 +2,8 @@ name: Sync upstream, build and release
 
 on:
   schedule:
-    # Every six hours (UTC); scheduled runs may be delayed by GitHub.
-    - cron: '17 */6 * * *'
+    # Every 10 minutes (UTC); scheduled runs may be delayed by GitHub.
+    - cron: '7,17,27,37,47,57 * * * *'
   workflow_dispatch:
   push:
     branches: [master]
