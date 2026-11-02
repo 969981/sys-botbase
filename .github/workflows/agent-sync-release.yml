@@ -1,0 +1,179 @@
+name: Sync sys-agent upstream, build and release
+
+on:
+  schedule:
+    # Every 10 minutes UTC; scheduled runs can be delayed by GitHub.
+    - cron: '5,15,25,35,45,55 * * * *'
+  workflow_dispatch:
+  push:
+    branches: [master]
+    paths:
+      - .github/workflows/agent-sync-release.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sys-agent-upstream-release
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Synchronize sys-agent custom/main into agent
+    runs-on: ubuntu-latest
+    outputs:
+      publish: ${{ steps.check.outputs.publish }}
+      upstream_sha: ${{ steps.sync.outputs.upstream_sha }}
+      head_sha: ${{ steps.sync.outputs.head_sha }}
+      tag: ${{ steps.sync.outputs.tag }}
+    steps:
+      - name: Checkout master for workflow control
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Create or synchronize agent branch
+        id: sync
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add agent-upstream https://github.com/leolovenet/sys-agent.git
+          git fetch --no-tags agent-upstream refs/heads/custom/main
+          upstream_sha="$(git rev-parse FETCH_HEAD)"
+
+          if git ls-remote --exit-code origin refs/heads/agent >/dev/null 2>&1; then
+            git fetch --no-tags origin refs/heads/agent:refs/remotes/origin/agent
+            git switch -C agent refs/remotes/origin/agent
+            if git merge-base --is-ancestor "$upstream_sha" HEAD; then
+              echo "agent branch already contains upstream $upstream_sha"
+            else
+              # Never silently overwrite local commits or resolve conflicts by force.
+              git merge --no-edit "$upstream_sha"
+              git push origin HEAD:refs/heads/agent
+            fi
+            head_sha="$(git rev-parse HEAD)"
+          else
+            # Bootstrap from the source Git history (not the unrelated master).
+            git push origin "$upstream_sha":refs/heads/agent
+            head_sha="$upstream_sha"
+          fi
+
+          tag="agent-${upstream_sha:0:12}"
+          echo "upstream_sha=$upstream_sha" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Synchronized agent branch to $head_sha (upstream $upstream_sha)"
+
+      - name: Skip releases that already exist
+        id: check
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.sync.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $RELEASE_TAG already published; skip."
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Release $RELEASE_TAG missing; compile and publish."
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build-release:
+    name: Build and test sys-agent; publish release
+    needs: sync
+    if: needs.sync.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    container:
+      image: devkitpro/devkita64:20260219
+    steps:
+      - name: Checkout synchronized agent sources and pinned submodules
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.head_sha }}
+          fetch-depth: 1
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Verify checkout
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ needs.sync.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          test -f sys-agent/Makefile
+          test -f sys-agent/source/main.c
+          test -f third_party/ftpsrv/src/ftpsrv.c
+
+      - name: Build with devkitPro and run upstream tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          source /opt/devkitpro/switchvars.sh
+          make -j2
+          test -s sys-agent/sys-agent.nsp
+          test -s sys-agent/43000000000000A6/exefs.nsp
+          make test
+          ls -lh sys-agent/sys-agent.nsp
+
+      - name: Package SD-card files for title ID A6
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.sync.outputs.tag }}
+        run: |
+          set -euo pipefail
+          module_dir="release/package/atmosphere/contents/43000000000000A6"
+          mkdir -p "$module_dir" release/assets
+          cp -a sys-agent/43000000000000A6/. "$module_dir/"
+          test -s "$module_dir/exefs.nsp"
+          test -f "$module_dir/flags/boot2.flag"
+          test -s "$module_dir/toolbox.json"
+          cp sys-agent/sys-agent.nsp release/assets/sys-agent.nsp
+          (cd release/package && zip -q -r "../assets/sys-agent-${RELEASE_TAG}.zip" atmosphere)
+          unzip -l "release/assets/sys-agent-${RELEASE_TAG}.zip"
+          sha256sum release/assets/*.nsp release/assets/*.zip > release/assets/SHA256SUMS
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sys-agent-${{ needs.sync.outputs.tag }}
+          path: release/assets/*
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish versioned agent release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.sync.outputs.tag }}
+          target_commitish: ${{ needs.sync.outputs.head_sha }}
+          name: sys-agent (${{ needs.sync.outputs.tag }})
+          draft: false
+          prerelease: false
+          generate_release_notes: false
+          body: |
+            Automated build of [leolovenet/sys-agent](https://github.com/leolovenet/sys-agent)
+            branch `custom/main`, tracked as [agent](https://github.com/969981/sys-botbase/tree/agent).
+            Upstream SHA: `${{ needs.sync.outputs.upstream_sha }}`
+            Built SHA: `${{ needs.sync.outputs.head_sha }}`
+
+            Back up your existing `atmosphere/contents/43000000000000A6` folder,
+            extract the ZIP at your Switch SD-card root, then fully reboot.
+            The archive includes `exefs.nsp`, `toolbox.json`, and `flags/boot2.flag`.
+
+            This module uses title ID `43000000000000A6`, distinct from sys-botbase
+            and USB-Botbase (`430000000000000B`). Release names and installation
+            folders are isolated. Running more than one remote control/debugging sysmodule
+            at once may still cause port or debugging conflicts.
+            Unofficial build; real-hardware behavior is not validated by this CI.
+          files: |
+            release/assets/sys-agent.nsp
+            release/assets/sys-agent-*.zip
+            release/assets/SHA256SUMS
+          fail_on_unmatched_files: true
