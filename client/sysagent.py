@@ -21,7 +21,7 @@ TERMINAL_STATES = {"done", "cancelled", "error"}
 # The client is versioned on its own: this number moves when this file changes, while the
 # sysmodule on the console keeps its own version (whatever `getVersion` answers).  `version`
 # prints both, labelled, so a mismatch is obvious; `--version` prints this one alone.
-CLIENT_VERSION = "1.2.1"
+CLIENT_VERSION = "1.2.4"
 TRACE_SCHEMA_VERSION = 1
 TRACE_PROFILE_SCHEMA_VERSION = 2
 TRACE_BOOT_EPOCH_TOLERANCE_MS = 2000
@@ -335,7 +335,7 @@ ERROR_CODE_NOTES = {
     "WAIT_TIMEOUT": "the requested process was not created before the timeout",
     "DNS_RESOLVE_FAILED": "the console resolver could not resolve the hostname",
     "DNS_NO_ADDRESS": "the hostname resolved without an IPv4 address",
-    "NO_MEMORY": "there was not enough memory to format the response",
+    "NO_MEMORY": "the sys-agent could not allocate enough memory for the requested operation",
     "NETWORK_BUSY": "another console-side URL request is still running",
     "NETWORK_UNAVAILABLE": "the console-side network worker is unavailable",
     "HTTP_TIMEOUT": "the URL request timed out",
@@ -573,6 +573,7 @@ class ClickSequence:
     tokens: int
     estimated_ms: int
     done: bool
+    cancelled: bool = False
 
 
 class SysAgentClient:
@@ -771,6 +772,23 @@ class SysAgentClient:
         if name not in queries:
             raise ValueError("unsupported system query")
         return require_ok(self.command(queries[name], retry=True))
+
+    def time_sync(self, enabled: bool | None = None) -> dict[str, str]:
+        """Read or change Horizon's synchronize-clock-via-Internet setting."""
+        if enabled is None:
+            return require_ok(self.command("systemTimeSync", retry=True))
+        state = "enabled" if enabled else "disabled"
+        return require_ok(self.command(f"systemTimeSync {state}", retry=False))
+
+    def set_system_time(self, unix_timestamp: int,
+                        clock: str = "local") -> dict[str, str]:
+        """Set the clock and disable Internet correction, then return readbacks."""
+        if not 1 <= unix_timestamp <= 0x7FFFFFFFFFFFFFFF:
+            raise ValueError("Unix timestamp must be in 1..0x7FFFFFFFFFFFFFFF")
+        if clock not in {"local", "user"}:
+            raise ValueError("clock must be local or user")
+        return require_ok(self.command(
+            f"systemTimeSet {unix_timestamp} {clock}", retry=False))
 
     def account_bindings(self) -> dict[str, str]:
         return require_ok(self.command("accountBindings", retry=True))
@@ -1184,12 +1202,35 @@ class SysAgentClient:
                 line = self._readline().decode("utf-8", errors="replace")
             finally:
                 self._socket.settimeout(self.timeout)
+        if line == "cancelled":
+            return ClickSequence(tokens=tokens, estimated_ms=estimated_ms,
+                                 done=False, cancelled=True)
         if line != "done":
-            raise SysAgentProtocolError(f"expected 'done' from clickSeq, got {line!r}")
+            raise SysAgentProtocolError(
+                f"expected 'done' or 'cancelled' from clickSeq, got {line!r}")
         return ClickSequence(tokens=tokens, estimated_ms=estimated_ms, done=True)
 
-    def click_cancel(self) -> None:
-        self._bare_command("clickCancel", expect_output=False)
+    def click_cancel(self) -> dict[str, str]:
+        """Request cancellation on a separate connection.
+
+        The connection waiting for a clickSeq result may still be blocked in
+        recv(), so cancellation must never reuse it.
+        """
+        with socket.create_connection((self.host, self.port),
+                                      min(self.timeout, 2.0)) as cancel_socket:
+            cancel_socket.sendall(b"clickCancel\r\n")
+            data = bytearray()
+            while b"\n" not in data:
+                chunk = cancel_socket.recv(1024)
+                if not chunk:
+                    break
+                data.extend(chunk)
+                if len(data) > RESPONSE_LIMIT:
+                    raise SysAgentProtocolError("clickCancel response is too large")
+        if not data:
+            return {}
+        line = bytes(data).split(b"\n", 1)[0].rstrip(b"\r").decode("ascii")
+        return require_ok(parse_response(line))
 
     def detach_controller(self) -> None:
         self._bare_command("detachController", expect_output=False)
@@ -3992,6 +4033,19 @@ def _cmd_system_query(client: SysAgentClient, args: argparse.Namespace) -> None:
     _emit(client.system_query(args.query), args)
 
 
+def _cmd_system_get_time(client: SysAgentClient, args: argparse.Namespace) -> None:
+    _emit(client.system_query("time"), args)
+
+
+def _cmd_system_time_sync(client: SysAgentClient, args: argparse.Namespace) -> None:
+    enabled = None if args.state == "status" else args.state == "enabled"
+    print_fields(client.time_sync(enabled))
+
+
+def _cmd_system_time_set(client: SysAgentClient, args: argparse.Namespace) -> None:
+    print_fields(client.set_system_time(args.unix_timestamp, args.clock))
+
+
 def _cmd_account_bindings(client: SysAgentClient, args: argparse.Namespace) -> None:
     _emit(client.account_bindings(), args)
 
@@ -4254,12 +4308,25 @@ def _cmd_set_stick(client: SysAgentClient, args: argparse.Namespace) -> None:
     client.set_stick(args.side, args.x, args.y)
 
 
-def _cmd_click_seq(client: SysAgentClient, args: argparse.Namespace) -> None:
-    result = client.click_seq(args.sequence, wait_done=not args.no_wait)
+def _cmd_click_seq(client: SysAgentClient,
+                   args: argparse.Namespace) -> int | None:
+    try:
+        result = client.click_seq(args.sequence, wait_done=not args.no_wait)
+    except KeyboardInterrupt:
+        print("cancel requested", file=sys.stderr)
+        try:
+            client.click_cancel()
+        except KeyboardInterrupt:
+            print("warning: cancellation was interrupted again", file=sys.stderr)
+        except (OSError, ValueError, SysAgentProtocolError) as error:
+            print(f"warning: could not cancel click sequence: {error}", file=sys.stderr)
+        return 130
     if result.done:
         # Keep the word scripts already grep for, and add what the console
         # expanded: `tokens` shows a repeat took effect, `estMs` is its estimate.
         print(f"done tokens={result.tokens} estMs={result.estimated_ms}")
+    elif result.cancelled:
+        print("cancelled")
 
 
 def _cmd_input_capabilities(client: SysAgentClient, args: argparse.Namespace) -> None:
@@ -5414,17 +5481,27 @@ def _cmd_search(client: SysAgentClient, args: argparse.Namespace) -> int:
     session = client.start(args.start, args.end, args.pattern)
     print(f"session={session}", file=sys.stderr)
     try:
-        status = client.wait(session, args.poll_interval)
-    except KeyboardInterrupt:
-        client.cancel(session)
-        print("cancel requested", file=sys.stderr)
-        return 130
-    print(dataclasses.asdict(status), file=sys.stderr)
-    if status.state == "error":
-        return 2
-    for address in client.iter_results(session, args.page_size):
-        print(f"0x{address:016X}")
-    return 0 if status.state == "done" else 1
+        try:
+            status = client.wait(session, args.poll_interval)
+        except KeyboardInterrupt:
+            print("cancel requested", file=sys.stderr)
+            return 130
+        print(dataclasses.asdict(status), file=sys.stderr)
+        if status.state == "error":
+            return 2
+        for address in client.iter_results(session, args.page_size):
+            print(f"0x{address:016X}")
+        return 0 if status.state == "done" else 1
+    finally:
+        try:
+            status = client.status(session)
+            if status.state not in TERMINAL_STATES:
+                client.cancel(session)
+                client.wait(session, args.poll_interval)
+            client.close_session(session)
+        except (OSError, SysAgentProtocolError) as error:
+            print(f"warning: could not close search session {session}: {error}",
+                  file=sys.stderr)
 
 
 # ---- input button table -----------------------------------------------------
@@ -5507,6 +5584,8 @@ CLICK_SEQ_HELP = "\n".join((
     "  N is 1..1000, groups nest up to 4 deep, at most 1024 tokens overall; a",
     "  wait inside a group repeats with it. A sequence the console cannot expand",
     "  is refused with ERR code=BAD_SEQUENCE before any input is sent.",
+    "",
+    "Press Ctrl+C to cancel the running sequence on the console.",
     "",
     BUTTON_HELP,
 ))
@@ -5626,6 +5705,20 @@ COMMANDS: tuple[Command | CommandGroup, ...] = (
                      metavar="QUERY"),
                  JSON_ARG, OUT_ARG),
                 SYSTEM_QUERY_HELP),
+        Command("get-time", "Alias for `system query time`", _cmd_system_get_time,
+                (JSON_ARG, OUT_ARG)),
+        Command("set-time", "Set the device clock and disable Internet time sync",
+                _cmd_system_time_set,
+                (Arg("unix_timestamp", "UTC Unix timestamp in seconds",
+                     type=parse_int, metavar="UNIX"),
+                 Arg("clock", "clock to change (default local)",
+                     choices=("local", "user"), default="local",
+                     flags=("--clock",)))),
+        Command("time-sync", "Read or change the Internet time-synchronization setting",
+                _cmd_system_time_sync,
+                (Arg("state", "status, enabled, or disabled",
+                     choices=("status", "enabled", "disabled"),
+                     nargs="?", default="status"),)),
         Command("account-bindings", "List local users and their local BAAS/NAS binding state",
                 _cmd_account_bindings, (JSON_ARG, OUT_ARG)),
         Command("save-dump", "Export a read-only NAND System Save tree to SD",

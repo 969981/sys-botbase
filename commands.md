@@ -15,7 +15,9 @@ The system-management protocol is additive and uses single-line `OK key=value` o
 |--|--|--|--|
 |systemCapabilities|Lists protocol version, query groups, actions, limits, and sensitive-data policy|none|`systemCapabilities`|
 |systemInfo|Reports firmware, hardware model, region, language, device nickname, and serial number|none|`systemInfo`|
-|systemTime|Reports Unix time, timezone, and uptime|none|`systemTime`|
+|systemTime|Reports Unix time, timezone, and uptime. The client also exposes this as `system get-time`|none|`systemTime`|
+|systemTimeSet|Disables Horizon's Internet time synchronization, sets a device clock from a UTC Unix timestamp, then reads both states back. The default `local` clock is the one used for displayed local time; `user` selects the user-system clock. Clock verification allows a two-second readback drift; `syncVerified` confirms both the persistent and runtime synchronization values are disabled|unixSeconds, optional `local` or `user`|`systemTimeSet 1762387200` / `systemTimeSet 1762387200 user`|
+|systemTimeSync|Reports or changes Horizon's "Synchronize Clock via Internet" setting. Reads report both the persisted `set:sys` value and the live `time:a` value; writes update both and verify them|none, or `enabled` / `disabled`|`systemTimeSync` / `systemTimeSync enabled` / `systemTimeSync disabled`|
 |powerStatus|Reports battery, charger, voltage, health, temperature, and current-limit fields|none|`powerStatus`|
 |storageStatus|Reports SD mount state and total/free/used bytes|none|`storageStatus`|
 |networkStatus|Reports link state, signal strength, and current IPv4 configuration|none|`networkStatus`|
@@ -78,6 +80,25 @@ searches, FTP transfers, open files, and the command connection. A successful re
 reach the client before the requested state change takes effect. Clients must never retry these
 non-idempotent commands automatically. `systemSleep` remains experimental until real-device
 acceptance succeeds and is advertised as such by `systemCapabilities`.
+
+`systemTimeSet` takes a UTC Unix timestamp in seconds, not a local wall-clock date. Set the
+timezone separately through Horizon if needed. The command uses `time:a` and changes the
+`local` clock by default because that is the clock whose value feeds the user clock and displayed
+system time; `user` remains available for explicit user-system-clock maintenance. Before
+changing the clock it disables "Synchronize Clock via Internet" in both `set:sys` and `time:a`,
+so network correction cannot overwrite the requested time. The response reports the previous
+persistent/runtime synchronization values, their state after the write, `verified` for the
+clock readback, and `syncVerified` for the disabled state. If setting the clock fails, the
+command attempts to restore both previous synchronization values. Setting an incorrect clock
+can invalidate TLS and other time-sensitive operations. The command is never retried
+automatically.
+
+`systemTimeSync` is the equivalent of Horizon's "Synchronize Clock via Internet" option. It
+controls whether the user-system clock follows network time; it does not itself fetch a time
+from an NTP server. Reads return `persistent` from `set:sys` and `runtime` from `time:a`, with
+`consistent` indicating whether they agree. Writes first persist the setting through `set:sys`,
+then update the live `time:a` user clock, and read both back as `verified`. The client command is
+`system time-sync [status|enabled|disabled]`. Writes are never retried automatically.
 
 `systemRebootEmuMMC` reads `sdmc:/bootloader/hekate_ipl.ini` on every invocation and requires
 exactly one main-file boot entry with `id=Atm-Emu`. It refuses to reboot if the ID is missing,
@@ -799,9 +820,9 @@ See https://github.com/olliz0r/sys-botbase/blob/master/sys-botbase/source/util.c
 |release|Releases a button from being pressed|1. buttonType| release A|
 |click| Holds a button pressed and releases it after a configured period of time<br>default 50ms| 1. buttonType| click A|
 |setStick|Sets stick position|1. LEFT/RIGHT<br>2.XVal (-0x8000 is min, 0x7FFF is max)<br>3.YVal| setStick LEFT 0x7FFF 0x0|
-|clickSeq|Sends several button inputs and wait commands in sequence, then answers `done`. It first answers `OK tokens=<n> estMs=<ms>` with what it expanded, so a caller can size its wait|1. single string (no spaces) with comma-separated items out of the following<br><br>**buttonType** for click<br>**+buttonType** for press<br>**-buttonType** for release<br>**Wnumber** to sleep number ms<br>**%X,Y** move left stick to position X Y<br>**&X,Y** move right stick to position X Y<br>**item*N** repeat one item N times<br>**(items)*N** repeat a group N times (groups nest up to 4 deep, N is 1-1000, at most 1024 expanded tokens and 64 KiB of text; a `W` wait inside a group repeats with it)<br><br>A sequence that cannot be expanded is refused with `ERR code=BAD_SEQUENCE index=<offset> detail=<reason>` before any input is sent| clickSeq A,W1000,B,W200,DUP,W500,DD,W350,%5000,1500,W2650,%0,0<br>clickSeq PLUS,W500,(DDOWN,W100)*10,A,W200
+|clickSeq|Sends several button inputs and wait commands in sequence, then answers `done`, or `cancelled` after `clickCancel`. It first answers `OK tokens=<n> estMs=<ms>` with what it expanded, so a caller can size its wait|1. single string (no spaces) with comma-separated items out of the following<br><br>**buttonType** for click<br>**+buttonType** for press<br>**-buttonType** for release<br>**Wnumber** to sleep number ms<br>**%X,Y** move left stick to position X Y<br>**&X,Y** move right stick to position X Y<br>**item*N** repeat one item N times<br>**(items)*N** repeat a group N times (groups nest up to 4 deep, N is 1-1000, at most 1024 expanded tokens and 64 KiB of text; a `W` wait inside a group repeats with it)<br><br>A sequence that cannot be expanded is refused with `ERR code=BAD_SEQUENCE index=<offset> detail=<reason>` before any input is sent| clickSeq A,W1000,B,W200,DUP,W500,DD,W350,%5000,1500,W2650,%0,0<br>clickSeq PLUS,W500,(DDOWN,W100)*10,A,W200
 |clickSeqCapabilities|Reports the click-seq syntax this build accepts: `OK version=1 syntax=click,press,release,wait,stick repeat=paren-star maxCount=1000 maxDepth=4 maxTokens=1024 maxBytes=65536`|none|clickSeqCapabilities|
-|clickCancel|Interrupts click sequence|none|clickCancel|
+|clickCancel|Interrupts the current click sequence and answers `OK cancel=requested`. A cancelled sequence releases all held buttons and returns both sticks to center before its caller receives `cancelled`|none|clickCancel|
 |detachController|Forces the virtual controller to detach, useful in cases where it bugs out|none|detachController|
 |controllerStatus|One-line state of the virtual controller: `initialised`, HDLS handle/session, `attached`, device type, npad interface, `idleRelease`, `takeover`, the row held in the hid:dbg assignment table (`slot`), the last `hiddbgSetHdlsState` error, and the hidsys owner of player 1 (`npad0=`)<br>Read-only: reports `initialised=0` instead of creating a device|none|controllerStatus|
 |controllerDump|Multi-line diagnostic dump: hid:dbg HDLS->npad assignment table, every controller hid:dbg knows about, and the hidsys owner of each player slot plus the controller layout signature, pad count, interface and controller number|none|controllerDump|
@@ -815,6 +836,12 @@ The virtual controller rebuilds itself when the console reconfigures its control
 re-attaches the device (when the controller layout changed) and waits until HOS has
 routed it - 50 ms at least, 150 ms at most, ~50 ms in practice - before sending the
 state, so a topology change cannot leave the input silently dead.
+
+`clickCancel` is handled by the command thread while the sequence runs in the click thread.
+Long `W` items sleep in 10 ms slices and check the cancellation flag between slices, so
+`A,W60000,A` can be stopped promptly instead of waiting for the full minute. The final
+`done` or `cancelled` line is written directly to the connection that submitted `clickSeq`,
+even when the cancellation request arrived on another connection.
 
 In docked mode a game binds a resident player to one controller at a time: while the
 virtual controller holds player 1 the console's own controller cannot reliably drive the

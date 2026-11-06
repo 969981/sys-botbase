@@ -50,6 +50,7 @@ class FakeState:
         self.flaky_peek_remaining = 0
         self.repeat_support = True
         self.sequence_error = False
+        self.sequence_cancelled = False
         self.trace_busy = False
         self.trace_active = False
         self.multi_trace_active = False
@@ -279,6 +280,20 @@ class FakeHandler(socketserver.StreamRequestHandler):
             elif command[0] in {"systemInfo", "systemTime", "powerStatus", "storageStatus",
                                "networkStatus", "networkProfile", "accountStatus"}:
                 response = f"OK command={command[0]} sample=1 errors=field:0x0"
+            elif command[0] == "systemTimeSet":
+                response = (
+                    f"OK clock={command[2]} requestedUnix={command[1]} "
+                    f"previousUnix=1700000000 observedUnix={command[1]} "
+                    "driftSeconds=0 verified=1 previousSyncPersistent=1 "
+                    "previousSyncRuntime=1 syncPersistent=0 syncRuntime=0 syncVerified=1 "
+                    "errors=previous:0x0,readback:0x0,syncPersistent:0x0,syncRuntime:0x0"
+                )
+            elif command[0] == "systemTimeSync":
+                enabled = 1 if len(command) == 1 or command[1] == "enabled" else 0
+                response = (
+                    f"OK enabled={enabled} persistent={enabled} runtime={enabled} "
+                    "consistent=1 verified=1 errors=persistent:0x0,runtime:0x0"
+                )
             elif command[0] == "accountBindings":
                 response = (
                     "OK count=1 users=0:0123456789ABCDEF:"
@@ -413,7 +428,7 @@ class FakeHandler(socketserver.StreamRequestHandler):
                 response = None
             elif command[0] == "freezeCount":
                 response = "03"
-            elif command[0] in {"press", "release", "click", "setStick", "clickCancel",
+            elif command[0] in {"press", "release", "click", "setStick",
                                  "detachController", "touch", "touchHold", "touchDraw",
                                  "touchCancel", "key", "keyMod", "keyMulti",
                                  "screenOff", "screenOn"}:
@@ -451,12 +466,15 @@ class FakeHandler(socketserver.StreamRequestHandler):
                 repeat = "repeat=paren-star" if state.repeat_support else "repeat=absent"
                 response = ("OK version=1 syntax=click,press,release,wait,stick "
                             f"{repeat} maxCount=1000 maxDepth=4 maxTokens=1024 maxBytes=65536")
+            elif command[0] == "clickCancel":
+                response = "OK cancel=requested"
             elif command[0] == "clickSeq":
                 if state.sequence_error:
                     response = "ERR code=BAD_SEQUENCE index=3 detail=bad-syntax"
                 else:
                     tokens = len([token for token in command[1].split(",") if token])
-                    response = f"OK tokens={tokens} estMs={tokens * 50}\ndone"
+                    final = "cancelled" if state.sequence_cancelled else "done"
+                    response = f"OK tokens={tokens} estMs={tokens * 50}\n{final}"
             elif command[0] == "game":
                 if command[1] == "icon":
                     response = (b"\xFF\xD8" + b"ICON").hex().upper()
@@ -559,6 +577,12 @@ class FakeServer(socketserver.ThreadingTCPServer):
         super().__init__(("127.0.0.1", 0), FakeHandler)
         self.state = FakeState()
 
+    def handle_error(self, request, client_address) -> None:
+        import sys
+        if isinstance(sys.exc_info()[1], ConnectionResetError):
+            return
+        super().handle_error(request, client_address)
+
 
 class ClientTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -614,6 +638,20 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(client.set_wireless(False)["wireless"], "0")
             self.assertEqual(client.lock_screen_status()["lockScreen"], "0")
             self.assertEqual(client.set_lock_screen(True)["lockScreen"], "1")
+            response = client.set_system_time(1700000000)
+            self.assertEqual(response["verified"], "1")
+            self.assertEqual(response["syncVerified"], "1")
+            self.assertEqual(self.server.state.last_command,
+                             ["systemTimeSet", "1700000000", "local"])
+            response = client.set_system_time(1700000123, "user")
+            self.assertEqual(response["clock"], "user")
+            self.assertEqual(self.server.state.last_command,
+                             ["systemTimeSet", "1700000123", "user"])
+            self.assertEqual(client.time_sync()["enabled"], "1")
+            self.assertEqual(self.server.state.last_command, ["systemTimeSync"])
+            self.assertEqual(client.time_sync(False)["enabled"], "0")
+            self.assertEqual(self.server.state.last_command,
+                             ["systemTimeSync", "disabled"])
             self.assertEqual(client.system_action("reboot")["action"], "systemReboot")
             self.assertEqual(self.server.state.last_command, ["systemReboot"])
             # Lock/unlock is server-side by default; the flag opts out.
@@ -628,6 +666,10 @@ class ClientTests(unittest.TestCase):
                 client.system_action("sleep", unlock=False)
             with self.assertRaises(ValueError):
                 client.process_list(0, 65)
+            with self.assertRaises(ValueError):
+                client.set_system_time(0)
+            with self.assertRaises(ValueError):
+                client.set_system_time(1700000000, "network")
             with self.assertRaises(ValueError):
                 client.system_action("payload")
 
@@ -660,6 +702,50 @@ class ClientTests(unittest.TestCase):
                 client.program_terminate(0)
             with self.assertRaises(ValueError):
                 client.account_unlink(0, 0)
+
+    def test_system_set_time_cli(self) -> None:
+        import contextlib
+        import io
+        from client.sysagent import main
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            code = main([
+                "--host", "127.0.0.1", "--port", str(self.server.server_address[1]),
+                "--timeout", "1", "system", "set-time", "1700000000", "--clock", "user",
+            ])
+        self.assertEqual(code, 0)
+        self.assertIn("clock=user", output.getvalue())
+        self.assertEqual(self.server.state.last_command,
+                         ["systemTimeSet", "1700000000", "user"])
+
+    def test_system_time_alias_and_sync_cli(self) -> None:
+        import contextlib
+        import io
+        from client.sysagent import main
+
+        base = [
+            "--host", "127.0.0.1", "--port", str(self.server.server_address[1]),
+            "--timeout", "1", "system",
+        ]
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(main([*base, "get-time"]), 0)
+        self.assertIn("command=systemTime", output.getvalue())
+        self.assertEqual(self.server.state.last_command, ["systemTime"])
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(main([*base, "time-sync"]), 0)
+        self.assertIn("enabled=1", output.getvalue())
+        self.assertEqual(self.server.state.last_command, ["systemTimeSync"])
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(main([*base, "time-sync", "disabled"]), 0)
+        self.assertIn("enabled=0", output.getvalue())
+        self.assertEqual(self.server.state.last_command,
+                         ["systemTimeSync", "disabled"])
 
     def test_url_request_and_required_url(self) -> None:
         with self.client() as client:
@@ -2065,6 +2151,8 @@ class ClientTests(unittest.TestCase):
             require_ok(parse_response("ERR code=DEBUG_BUSY result=0x10201"))
         with self.assertRaisesRegex(SysAgentProtocolError, "bluetooth"):
             require_ok(parse_response("ERR code=WEIRD result=0x2F4471"))
+        with self.assertRaisesRegex(SysAgentProtocolError, "allocate enough memory"):
+            require_ok(parse_response("ERR code=NO_MEMORY"))
 
     def test_unknown_search_commands_and_status_fields(self) -> None:
         with self.client() as client:
@@ -2342,6 +2430,30 @@ class ClientTests(unittest.TestCase):
             with self.assertRaises(SysAgentProtocolError) as raised:
                 client.click_seq("(A*2")
             self.assertIn("BAD_SEQUENCE", str(raised.exception))
+
+    def test_click_seq_server_cancellation(self) -> None:
+        self.server.state.sequence_cancelled = True
+        with self.client() as client:
+            result = client.click_seq("A,W60000,A")
+        self.assertFalse(result.done)
+        self.assertTrue(result.cancelled)
+
+    def test_click_seq_ctrl_c_cancels_on_console(self) -> None:
+        import contextlib
+        import io
+        from client.sysagent import main
+
+        stderr = io.StringIO()
+        with patch.object(SysAgentClient, "click_seq", side_effect=KeyboardInterrupt):
+            with contextlib.redirect_stderr(stderr):
+                code = main([
+                    "--host", "127.0.0.1",
+                    "--port", str(self.server.server_address[1]),
+                    "--timeout", "1", "input", "click-seq", "A,W60000,A",
+                ])
+        self.assertEqual(code, 130)
+        self.assertIn("cancel requested", stderr.getvalue())
+        self.assertIn(["clickCancel"], self.server.state.commands)
 
     def test_late_diagnostic_does_not_desync_next_command(self) -> None:
         """A diagnostic printed after a silent command must not become the answer."""
@@ -2789,6 +2901,48 @@ class ClientTests(unittest.TestCase):
         code = main(["--host", "127.0.0.1", "--port", str(self.server.server_address[1]),
                      "--timeout", "1", "search", "refine", "9223372036854775809", "changed"])
         self.assertEqual(code, 0)
+
+    def test_search_run_closes_finished_session(self) -> None:
+        import contextlib
+        import io
+        from client.sysagent import main
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            code = main([
+                "--host", "127.0.0.1", "--port", str(self.server.server_address[1]),
+                "--timeout", "1", "search", "run", "0x80000000", "0x80001000", "DEADBEEF",
+                "--poll-interval", "0",
+            ])
+        self.assertEqual(code, 0)
+        self.assertIn(["searchClose", "7"], self.server.state.commands)
+
+    def test_search_run_closes_cancelled_session(self) -> None:
+        import contextlib
+        import io
+        from client.sysagent import SysAgentClient, main
+
+        original_wait = SysAgentClient.wait
+        interrupted = False
+
+        def interrupt_once(
+            client: SysAgentClient, session: int, poll_interval: float = 0.25,
+        ):
+            nonlocal interrupted
+            if not interrupted:
+                interrupted = True
+                raise KeyboardInterrupt
+            return original_wait(client, session, poll_interval)
+
+        with patch.object(SysAgentClient, "wait", interrupt_once):
+            with contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                code = main([
+                    "--host", "127.0.0.1", "--port", str(self.server.server_address[1]),
+                    "--timeout", "1", "search", "run", "0x80000000", "0x80001000",
+                    "DEADBEEF", "--poll-interval", "0",
+                ])
+        self.assertEqual(code, 130)
+        self.assertIn(["searchCancel", "7"], self.server.state.commands)
+        self.assertIn(["searchClose", "7"], self.server.state.commands)
 
     def test_legacy_cli_and_raw(self) -> None:
         from client.sysagent import main
