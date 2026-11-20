@@ -28,7 +28,7 @@ jobs:
       tag: ${{ steps.sync.outputs.tag }}
     steps:
       - name: Checkout master for workflow control
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: master
           fetch-depth: 0
@@ -93,7 +93,7 @@ jobs:
       image: devkitpro/devkita64:20260219
     steps:
       - name: Checkout synchronized agent sources and pinned submodules
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: ${{ needs.sync.outputs.head_sha }}
           fetch-depth: 1
