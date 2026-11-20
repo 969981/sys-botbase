@@ -1069,8 +1069,20 @@ class ClientTests(unittest.TestCase):
             "resolve", "set", "set-dns", "url-req", "wireless-disabled",
             "wireless-enabled",
         )
-        positions = [help_text.index(f"    {name} ") for name in ordered]
-        self.assertEqual(positions, sorted(positions))
+        # argparse adjusts the indentation of command help to fit the widest
+        # name, so checking for exactly four spaces is not portable.
+        import argparse
+        root_subparsers = next(
+            action for action in build_parser()._actions
+            if isinstance(action, argparse._SubParsersAction)
+        )
+        network_parser = root_subparsers.choices["network"]
+        network_subparsers = next(
+            action for action in network_parser._actions
+            if isinstance(action, argparse._SubParsersAction)
+        )
+        self.assertEqual(tuple(network_subparsers.choices), ordered)
+        self.assertIn("wireless-enabled", help_text)
 
     def test_audio_commands(self) -> None:
         with self.client() as client:
