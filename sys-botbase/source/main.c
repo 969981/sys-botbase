@@ -1076,8 +1076,13 @@ int main()
                 }
                 else
                 {
+                    // Socket framing does not access process memory; do not block
+                    // the freeze worker while a peer is still sending its line.
+                    mutexUnlock(&freezeMutex);
                     u64 receiveStart = armGetSystemTick();
                     int len = read_wire_line(pfds[i].fd, linebuf, MAX_LINE_LENGTH, 5000);
+                    u64 receiveEnd = armGetSystemTick();
+                    mutexLock(&freezeMutex);
                     u64 dispatch = armGetSystemTick();
                     bool failed = len < 0;
                     if (!failed)
@@ -1087,10 +1092,10 @@ int main()
                             failed = true;
                         else
                         {
-                            markReadPerfInput(dispatch - receiveStart, dispatch);
-                            parseArgs(linebuf, &argmain);
-                            if (echoCommands) printf("%s\n", linebuf);
-                            failed = fflush(stdout) != 0 || ferror(stdout);
+                            markReadPerfInput(receiveEnd - receiveStart, dispatch);
+                            int status = parseArgs(linebuf, &argmain);
+                            if (status >= 0 && echoCommands) printf("%s\n", linebuf);
+                            failed = status < 0 || fflush(stdout) != 0 || ferror(stdout);
                         }
                     }
                     if (failed)
