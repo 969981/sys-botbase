@@ -5,10 +5,12 @@
 int parseArgs(char* origargstr, int (*callback)(int, char**))
 {
     char* argstr = malloc(strlen(origargstr) + 1);
+    if (!argstr) return -1;
     memcpy(argstr, origargstr, strlen(origargstr) + 1);
     int argc = 0;
 
     char* tmpstr = malloc(strlen(argstr) + 1);
+    if (!tmpstr) { free(argstr); return -1; }
     memcpy(tmpstr, argstr, strlen(argstr) + 1);
     for (char* p = strtok(tmpstr, " \r\n"); p != NULL; p = strtok(NULL, " \r\n")) {
         argc++;
@@ -17,10 +19,12 @@ int parseArgs(char* origargstr, int (*callback)(int, char**))
 
     if (argc == 0)
     {
+        free(argstr);
         return (*callback)(argc, NULL);
     }
 
     char** argv = malloc(sizeof(char*) * argc);
+    if (!argv) { free(argstr); return -1; }
     int i = 0;
     for (char* p = strtok(argstr, " \r\n"); p != NULL; p = strtok(NULL, " \r\n"))
         argv[i++] = p;
