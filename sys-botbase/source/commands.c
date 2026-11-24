@@ -268,6 +268,7 @@ void writeMem(u64 offset, u64 size, u8* val)
 
 typedef struct {
     u64 ranges, bytes, calls, attach_ticks, read_ticks, output_ticks, detach_ticks, total_ticks;
+    uint64_t encode_ticks, write_ticks;
     bool ok;
 } ReadPerf;
 
@@ -289,7 +290,7 @@ void markReadPerfInput(u64 ticks, u64 dispatch)
     dispatchTick = dispatch;
 }
 
-static u64 perfNow(void)
+static uint64_t perfNow(void)
 {
     return readPerfEnabled ? armGetSystemTick() : 0;
 }
@@ -312,11 +313,12 @@ void printReadPerf(void)
         return;
     }
     const ReadPerf *p = &lastReadPerf;
-    printf("readperf-v1 ok=%d ranges=%llu bytes=%llu calls=%llu input_ticks=%llu parse_dispatch_ticks=%llu attach_ticks=%llu read_ticks=%llu output_ticks=%llu detach_ticks=%llu total_ticks=%llu\n",
+    printf("readperf-v1 ok=%d ranges=%llu bytes=%llu calls=%llu input_ticks=%llu parse_dispatch_ticks=%llu attach_ticks=%llu read_ticks=%llu output_ticks=%llu encode_ticks=%llu write_ticks=%llu detach_ticks=%llu total_ticks=%llu\n",
         p->ok, (unsigned long long)p->ranges, (unsigned long long)p->bytes,
         (unsigned long long)p->calls, (unsigned long long)lastInputTicks,
         (unsigned long long)lastParseTicks, (unsigned long long)p->attach_ticks,
         (unsigned long long)p->read_ticks, (unsigned long long)p->output_ticks,
+        (unsigned long long)p->encode_ticks, (unsigned long long)p->write_ticks,
         (unsigned long long)p->detach_ticks, (unsigned long long)p->total_ticks);
 }
 
@@ -350,7 +352,8 @@ void peekInfinite(u64 offset, u64 size)
         p.read_ticks += perfNow() - phase;
         if (R_FAILED(rc)) goto done;
         phase = perfNow();
-        int status = read_wire_hex(stdout, out, (size_t)chunk);
+        int status = read_wire_hex_timed(stdout, out, (size_t)chunk,
+            readPerfEnabled ? perfNow : NULL, &p.encode_ticks, &p.write_ticks);
         p.output_ticks += perfNow() - phase;
         if (status != 0) goto done;
         fetched += chunk;
@@ -405,7 +408,8 @@ void peekMulti(u64* offset, u64* size, u64 count)
     }
     // Multi keeps all-or-nothing memory-read behavior and request order.
     phase = perfNow();
-    p.ok = read_wire_hex(stdout, out, (size_t)total) == 0;
+    p.ok = read_wire_hex_timed(stdout, out, (size_t)total,
+        readPerfEnabled ? perfNow : NULL, &p.encode_ticks, &p.write_ticks) == 0;
     p.output_ticks += perfNow() - phase;
 done:
     if (attached)
