@@ -51,6 +51,9 @@ bool getIsProgramOpen(u64 id);
 
 void poke(u64 offset, u64 size, u8* val);
 void writeMem(u64 offset, u64 size, u8* val);
+void configureReadPerf(bool enabled);
+void markReadPerfInput(u64 ticks, u64 dispatch);
+void printReadPerf(void);
 void peek(u64 offset, u64 size);
 void peekInfinite(u64 offset, u64 size);
 void peekMulti(u64* offset, u64* size, u64 count);
