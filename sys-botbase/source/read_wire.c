@@ -53,22 +53,32 @@ int read_wire_line(int fd, char *line, size_t capacity, int timeout_ms)
     return -1;
 }
 
-int read_wire_hex(FILE *out, const uint8_t *data, size_t length)
+int read_wire_hex_timed(FILE *out, const uint8_t *data, size_t length,
+    uint64_t (*ticks)(void), uint64_t *encode_ticks, uint64_t *write_ticks)
 {
     static const char digits[] = "0123456789ABCDEF";
     char buffer[8192];
     while (length)
     {
         size_t count = length > sizeof(buffer) / 2 ? sizeof(buffer) / 2 : length;
+        uint64_t start = ticks ? ticks() : 0;
         for (size_t i = 0; i < count; ++i)
         {
             buffer[2 * i] = digits[data[i] >> 4];
             buffer[2 * i + 1] = digits[data[i] & 15];
         }
-        if (fwrite(buffer, 1, count * 2, out) != count * 2)
-            return -1;
+        if (ticks && encode_ticks) *encode_ticks += ticks() - start;
+        start = ticks ? ticks() : 0;
+        size_t written = fwrite(buffer, 1, count * 2, out);
+        if (ticks && write_ticks) *write_ticks += ticks() - start;
+        if (written != count * 2) return -1;
         data += count;
         length -= count;
     }
     return 0;
+}
+
+int read_wire_hex(FILE *out, const uint8_t *data, size_t length)
+{
+    return read_wire_hex_timed(out, data, length, NULL, NULL, NULL);
 }
