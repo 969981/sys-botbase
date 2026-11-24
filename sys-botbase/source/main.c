@@ -225,7 +225,7 @@ int argmain(int argc, char** argv)
             offsets[i] = parseStringToInt(argv[(i * 2) + 1]);
             sizes[i] = parseStringToInt(argv[(i * 2) + 2]);
         }
-        peekMulti(offsets, sizes, itemCount);
+        peekAbsoluteMulti(offsets, sizes, itemCount);
     }
 
     if (!strcmp(argv[0], "peekMain"))
@@ -450,6 +450,10 @@ int argmain(int argc, char** argv)
         if (argc != 3)
             return 0;
 
+        if (!strcmp(argv[1], "readMerge")) {
+            configureReadMerge(parseStringToInt(argv[2]) != 0);
+        }
+
         if (!strcmp(argv[1], "readPerf")) {
             configureReadPerf(parseStringToInt(argv[2]) != 0);
         }
@@ -587,6 +591,11 @@ int argmain(int argc, char** argv)
         if (!ferror(stdout)) printf("\n");
 
         free(buf);
+    }
+
+    if (!strcmp(argv[0], "getReadMerge")) {
+        if (argc == 1) printReadMerge();
+        return 0;
     }
 
     if (!strcmp(argv[0], "getReadPerf")) {

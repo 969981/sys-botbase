@@ -36,6 +36,10 @@ jobs:
             -fno-omit-frame-pointer -pthread -Isys-botbase/source \
             sys-botbase/source/read_wire.c tests/test_read_wire.c -o /tmp/test_read_wire_san
           /tmp/test_read_wire_san
+          cc -std=c11 -Wall -Wextra -Werror -O2 -Isys-botbase/source tests/test_read_merge.c -o /tmp/test_read_merge
+          /tmp/test_read_merge
+          cc -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -Isys-botbase/source tests/test_read_merge.c -o /tmp/test_read_merge_san
+          /tmp/test_read_merge_san
   build:
     needs: host
     runs-on: ubuntu-latest

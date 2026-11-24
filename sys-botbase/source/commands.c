@@ -7,6 +7,7 @@
 #include "commands.h"
 #include "util.h"
 #include "read_wire.h"
+#include "read_merge.h"
 #include <stdint.h>
 
 
@@ -273,6 +274,13 @@ typedef struct {
 } ReadPerf;
 
 static bool readPerfEnabled = false;
+static bool absoluteReadMergeEnabled = false;
+#define READ_MERGE_MAX_BYTES 24480U
+
+void configureReadMerge(bool enabled) { absoluteReadMergeEnabled = enabled; }
+void printReadMerge(void) { printf("readmerge-v1 enabled=%d max_bytes=%u\n", absoluteReadMergeEnabled, READ_MERGE_MAX_BYTES); }
+
+static void peekMultiInternal(u64* offset, u64* size, u64 count, bool merge);
 static bool readPerfAvailable = false;
 static ReadPerf lastReadPerf;
 static u64 inputTicks, dispatchTick;
@@ -376,6 +384,16 @@ done:
 
 void peekMulti(u64* offset, u64* size, u64 count)
 {
+    peekMultiInternal(offset, size, count, false);
+}
+
+void peekAbsoluteMulti(u64* offset, u64* size, u64 count)
+{
+    peekMultiInternal(offset, size, count, absoluteReadMergeEnabled);
+}
+
+static void peekMultiInternal(u64* offset, u64* size, u64 count, bool merge)
+{
     u64 start = perfNow(), phase, parseTicks = readPerfEnabled ? start - dispatchTick : 0;
     ReadPerf p = { .ranges = count };
     u8 *out = NULL;
@@ -397,14 +415,19 @@ void peekMulti(u64* offset, u64* size, u64 count)
     attached = true;
     p.attach_ticks += perfNow() - phase;
     u64 ofs = 0;
-    for (u64 i = 0; i < count; ++i)
+    for (u64 i = 0; i < count; )
     {
+        u64 address = offset[i], length = size[i];
+        ++i;
+        while (merge && i < count && read_merge_can_extend(address, length,
+                offset[i], size[i], READ_MERGE_MAX_BYTES))
+            length += size[i++];
         phase = perfNow();
-        Result rc = readMem(out + ofs, offset[i], size[i]);
+        Result rc = readMem(out + ofs, address, length);
         p.calls++;
         p.read_ticks += perfNow() - phase;
         if (R_FAILED(rc)) goto done;
-        ofs += size[i];
+        ofs += length;
     }
     // Multi keeps all-or-nothing memory-read behavior and request order.
     phase = perfNow();
