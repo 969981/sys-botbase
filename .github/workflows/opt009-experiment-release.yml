@@ -1,0 +1,108 @@
+name: OPT-009 experimental Wi-Fi build and prerelease
+
+on:
+  push:
+    branches: ['perf/opt009-wifi-read']
+    paths:
+      - 'sys-botbase/**'
+      - 'tests/**'
+      - 'toolbox.json'
+      - 'Makefile'
+      - '.github/workflows/opt009-experiment-release.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: opt009-experiment-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  host:
+    if: github.ref == 'refs/heads/perf/opt009-wifi-read'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Portable protocol regression
+        run: |
+          set -euo pipefail
+          cc -std=c11 -Wall -Wextra -Werror -O2 -pthread -Isys-botbase/source \
+            sys-botbase/source/read_wire.c tests/test_read_wire.c -o /tmp/test_read_wire
+          /tmp/test_read_wire
+          cc -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined \
+            -fno-omit-frame-pointer -pthread -Isys-botbase/source \
+            sys-botbase/source/read_wire.c tests/test_read_wire.c -o /tmp/test_read_wire_san
+          /tmp/test_read_wire_san
+  build:
+    needs: host
+    runs-on: ubuntu-latest
+    container:
+      image: devkitpro/devkita64:20260219
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build pinned experimental revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          make -j2
+          test -s sys-botbase/sys-botbase.nsp
+      - name: Assemble separate experimental assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          module_dir="release/package/atmosphere/contents/430000000000000B"
+          mkdir -p "$module_dir/flags" release/assets
+          cp sys-botbase/sys-botbase.nsp "$module_dir/exefs.nsp"
+          cp toolbox.json "$module_dir/toolbox.json"
+          touch "$module_dir/flags/boot2.flag"
+          cp sys-botbase/sys-botbase.nsp release/assets/sys-botbase-opt009.nsp
+          (cd release/package && zip -q -r "../assets/sys-botbase-opt009-${GITHUB_SHA:0:12}.zip" atmosphere)
+          printf '%s\n' "$GITHUB_SHA" > release/assets/SOURCE_COMMIT
+          (cd release/assets && sha256sum sys-botbase-opt009.nsp sys-botbase-opt009-*.zip SOURCE_COMMIT > SHA256SUMS)
+          unzip -t release/assets/sys-botbase-opt009-*.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sys-botbase-opt009-${{ github.sha }}
+          path: release/assets/
+          if-no-files-found: error
+          retention-days: 30
+  publish:
+    needs: build
+    if: github.ref == 'refs/heads/perf/opt009-wifi-read'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: sys-botbase-opt009-${{ github.sha }}
+          path: release/assets
+      - name: Verify artifact identity and integrity
+        run: |
+          set -euo pipefail
+          cd release/assets
+          test "$(cat SOURCE_COMMIT)" = "$GITHUB_SHA"
+          sha256sum -c SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: opt009-exp-${{ github.sha }}
+          target_commitish: ${{ github.sha }}
+          name: sys-botbase OPT-009 experiment (${{ github.sha }})
+          draft: false
+          prerelease: true
+          make_latest: 'false'
+          generate_release_notes: false
+          body: |
+            Experimental Wi-Fi sysmodule. Source: ${{ github.sha }}
+            Host protocol regressions and devkitPro build required.
+            NOT Switch-device validated. Does not replace upstream stable releases.
+            Back up the current known-good module before isolated testing.
+          files: release/assets/*
+          fail_on_unmatched_files: true
