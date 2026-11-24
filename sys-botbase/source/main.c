@@ -12,6 +12,7 @@
 #include "args.h"
 #include "util.h"
 #include "freeze.h"
+#include "read_wire.h"
 #include <poll.h>
 
 #define TITLE_ID 0x430000000000000B
@@ -186,6 +187,7 @@ int argmain(int argc, char** argv)
         }
 
         u64 itemCount = (argc - 1) / 2;
+        if (itemCount > 512) { printf("\n"); return 0; }
         u64 offsets[itemCount];
         u64 sizes[itemCount];
 
@@ -213,6 +215,7 @@ int argmain(int argc, char** argv)
             return 0;
 
         u64 itemCount = (argc - 1) / 2;
+        if (itemCount > 512) { printf("\n"); return 0; }
         u64 offsets[itemCount];
         u64 sizes[itemCount];
 
@@ -254,6 +257,7 @@ int argmain(int argc, char** argv)
         }
 
         u64 itemCount = (argc - 1) / 2;
+        if (itemCount > 512) { printf("\n"); return 0; }
         u64 offsets[itemCount];
         u64 sizes[itemCount];
 
@@ -446,6 +450,10 @@ int argmain(int argc, char** argv)
         if (argc != 3)
             return 0;
 
+        if (!strcmp(argv[1], "readPerf")) {
+            configureReadPerf(parseStringToInt(argv[2]) != 0);
+        }
+
         if (!strcmp(argv[1], "mainLoopSleepTime")) {
             u64 time = parseStringToInt(argv[2]);
             mainLoopSleepTime = time;
@@ -573,14 +581,15 @@ int argmain(int argc, char** argv)
         if (R_FAILED(rc) && debugResultCodes)
             printf("capssc, 1204: %d\n", rc);
 
-        u64 i;
-        for (i = 0; i < outSize; i++)
-        {
-            printf("%02X", buf[i]);
-        }
-        printf("\n");
+        if (outSize <= bSize && read_wire_hex(stdout, (const uint8_t*)buf, (size_t)outSize) == 0)
+            printf("\n");
 
         free(buf);
+    }
+
+    if (!strcmp(argv[0], "getReadPerf")) {
+        if (argc == 1) printReadPerf();
+        return 0;
     }
 
     if (!strcmp(argv[0], "getVersion")) {
@@ -700,6 +709,7 @@ int argmain(int argc, char** argv)
             u64 solved = followMainPointer(jumps, count);
             solved += finalJump;
 
+            if (itemCount >= 40) { printf("\n"); return 0; }
             offsets[itemCount] = solved;
             sizes[itemCount] = size;
             itemCount++;
@@ -967,6 +977,7 @@ void add_to_pfds(struct pollfd* pfds[], int newfd, int* fd_count, int* fd_size)
 
     (*pfds)[*fd_count].fd = newfd;
     (*pfds)[*fd_count].events = POLLIN;
+    (*pfds)[*fd_count].revents = 0;
 
     (*fd_count)++;
 }
@@ -981,6 +992,10 @@ void del_from_pfds(struct pollfd pfds[], int i, int* fd_count)
 int main()
 {
     char* linebuf = malloc(sizeof(char) * MAX_LINE_LENGTH);
+    if (!linebuf) return 1;
+    // stdout is redirected between connections. Unbuffered output prevents
+    // pending data from a failed client leaking into another client's frame.
+    if (setvbuf(stdout, NULL, _IONBF, 0) != 0) { free(linebuf); return 1; }
 
     int c = sizeof(struct sockaddr_in);
     struct sockaddr_in client;
@@ -1031,6 +1046,15 @@ int main()
         mutexLock(&freezeMutex);
         for (int i = 0; i < fd_count; i++)
         {
+            if (i != 0 && !(pfds[i].revents & POLLIN) &&
+                (pfds[i].revents & (POLLERR | POLLHUP | POLLNVAL)))
+            {
+                shutdown(pfds[i].fd, SHUT_RDWR);
+                close(pfds[i].fd);
+                del_from_pfds(pfds, i, &fd_count);
+                --i;
+                continue;
+            }
             if (pfds[i].revents & POLLIN)
             {
                 if (pfds[i].fd == listenfd)
@@ -1051,33 +1075,29 @@ int main()
                 }
                 else
                 {
-                    bool readEnd = false;
-                    int readBytesSoFar = 0;
-                    while (!readEnd) {
-                        int len = recv(pfds[i].fd, &linebuf[readBytesSoFar], 1, 0);
-                        if (len <= 0)
-                        {
-                            close(pfds[i].fd);
-                            del_from_pfds(pfds, i, &fd_count);
-                            readEnd = true;
-                        }
+                    u64 receiveStart = armGetSystemTick();
+                    int len = read_wire_line(pfds[i].fd, linebuf, MAX_LINE_LENGTH, 5000);
+                    u64 dispatch = armGetSystemTick();
+                    bool failed = len < 0;
+                    if (!failed)
+                    {
+                        clearerr(stdout);
+                        if (dup2(pfds[i].fd, STDOUT_FILENO) < 0)
+                            failed = true;
                         else
                         {
-                            readBytesSoFar += len;
-                            if (linebuf[readBytesSoFar - 1] == '\n') {
-                                readEnd = true;
-                                linebuf[readBytesSoFar - 1] = 0;
-
-                                fflush(stdout);
-                                dup2(pfds[i].fd, STDOUT_FILENO);
-
-                                parseArgs(linebuf, &argmain);
-
-                                if (echoCommands) {
-                                    printf("%s\n", linebuf);
-                                }
-                            }
+                            markReadPerfInput(dispatch - receiveStart, dispatch);
+                            parseArgs(linebuf, &argmain);
+                            if (echoCommands) printf("%s\n", linebuf);
+                            failed = fflush(stdout) != 0 || ferror(stdout);
                         }
+                    }
+                    if (failed)
+                    {
+                        shutdown(pfds[i].fd, SHUT_RDWR);
+                        close(pfds[i].fd);
+                        del_from_pfds(pfds, i, &fd_count);
+                        --i;
                     }
                 }
             }
