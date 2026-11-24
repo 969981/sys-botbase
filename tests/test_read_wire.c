@@ -21,6 +21,12 @@ static void *fragment(void *arg)
     return NULL;
 }
 
+static uint64_t fake_ticks(void)
+{
+    static uint64_t now = 0;
+    return ++now;
+}
+
 int main(void)
 {
     int fd[2];
@@ -84,6 +90,14 @@ int main(void)
     }
     assert(fgetc(fp) == '\n');
     assert(fgetc(fp) == EOF);
+    fclose(fp);
+
+    fp = tmpfile();
+    assert(fp);
+    uint64_t encode_ticks = 0, write_ticks = 0;
+    assert(read_wire_hex_timed(fp, bytes, sizeof(bytes), fake_ticks, &encode_ticks, &write_ticks) == 0);
+    assert(encode_ticks == 6 && write_ticks == 6);
+    assert(ftell(fp) == 48960);
     fclose(fp);
     puts("read_wire host tests passed");
     return 0;
