@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/errno.h>
 #include <arpa/inet.h>
 #include <unistd.h>
@@ -971,9 +972,12 @@ int argmain(int argc, char** argv)
 void add_to_pfds(struct pollfd* pfds[], int newfd, int* fd_count, int* fd_size)
 {
     if (*fd_count == *fd_size) {
-        *fd_size *= 2;
-
-        *pfds = realloc(*pfds, sizeof(**pfds) * (*fd_size));
+        if (*fd_size > 1024 / 2) { close(newfd); return; }
+        int nextSize = *fd_size * 2;
+        struct pollfd* grown = realloc(*pfds, sizeof(**pfds) * nextSize);
+        if (!grown) { close(newfd); return; }
+        *pfds = grown;
+        *fd_size = nextSize;
     }
 
     (*pfds)[*fd_count].fd = newfd;
@@ -1002,6 +1006,7 @@ int main()
     struct sockaddr_in client;
 
     struct pollfd* pfds = malloc(sizeof * pfds * fd_size);
+    if (!pfds) { free(linebuf); return 1; }
 
     int listenfd = setupServerSocket();
     pfds[0].fd = listenfd;
@@ -1063,7 +1068,17 @@ int main()
                     newfd = accept(listenfd, (struct sockaddr*)&client, (socklen_t*)&c);
                     if (newfd != -1)
                     {
-                        add_to_pfds(&pfds, newfd, &fd_count, &fd_size);
+                        // Bound each blocking socket send, including stdout writes
+                        // through dup2. This is NOT a whole-response deadline.
+                        struct timeval sendTimeout = { .tv_sec = 5, .tv_usec = 0 };
+                        if (setsockopt(newfd, SOL_SOCKET, SO_SNDTIMEO,
+                                       &sendTimeout, sizeof(sendTimeout)) != 0)
+                        {
+                            shutdown(newfd, SHUT_RDWR);
+                            close(newfd);
+                        }
+                        else
+                            add_to_pfds(&pfds, newfd, &fd_count, &fd_size);
                     }
                     else {
                         svcSleepThread(1e+9L);
