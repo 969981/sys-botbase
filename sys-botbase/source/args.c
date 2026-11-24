@@ -1,36 +1,48 @@
-#include <stdio.h>
+#include <limits.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
 int parseArgs(char* origargstr, int (*callback)(int, char**))
 {
-    char* argstr = malloc(strlen(origargstr) + 1);
+    if (!origargstr || !callback) return -1;
+    size_t length = strlen(origargstr);
+    if (length == SIZE_MAX) return -1;
+    char* argstr = malloc(length + 1);
     if (!argstr) return -1;
-    memcpy(argstr, origargstr, strlen(origargstr) + 1);
+    memcpy(argstr, origargstr, length + 1);
+
+    /* Preserve the original command for echoCommands. Tokenize the copy
+       exactly once; grow the pointer array only when needed. */
+    size_t capacity = 0;
     int argc = 0;
-
-    char* tmpstr = malloc(strlen(argstr) + 1);
-    if (!tmpstr) { free(argstr); return -1; }
-    memcpy(tmpstr, argstr, strlen(argstr) + 1);
-    for (char* p = strtok(tmpstr, " \r\n"); p != NULL; p = strtok(NULL, " \r\n")) {
-        argc++;
-    }
-    free(tmpstr);
-
-    if (argc == 0)
+    char** argv = NULL;
+    char* p = argstr;
+    while (*p)
     {
-        free(argstr);
-        return (*callback)(argc, NULL);
+        p += strspn(p, " \r\n");
+        if (!*p) break;
+        if (argc == INT_MAX) goto fail;
+        if ((size_t)argc == capacity)
+        {
+            size_t next = capacity ? capacity * 2 : 16;
+            if (next < capacity || next > SIZE_MAX / sizeof(*argv)) goto fail;
+            char** grown = realloc(argv, next * sizeof(*argv));
+            if (!grown) goto fail;
+            argv = grown;
+            capacity = next;
+        }
+        argv[argc++] = p;
+        p += strcspn(p, " \r\n");
+        if (*p) *p++ = '\0';
     }
-
-    char** argv = malloc(sizeof(char*) * argc);
-    if (!argv) { free(argstr); return -1; }
-    int i = 0;
-    for (char* p = strtok(argstr, " \r\n"); p != NULL; p = strtok(NULL, " \r\n"))
-        argv[i++] = p;
-
-    int ret = (*callback)(argc, argv);
+    int ret = callback(argc, argv);
     free(argv);
     free(argstr);
     return ret;
+
+fail:
+    free(argv);
+    free(argstr);
+    return -1;
 }
