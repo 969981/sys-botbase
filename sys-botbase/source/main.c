@@ -404,16 +404,15 @@ int argmain(int argc, char** argv)
         if (argc != 2)
             return 0;
         NsApplicationControlData* buf = (NsApplicationControlData*)malloc(sizeof(NsApplicationControlData));
+        if (!buf) { printf("\n"); return 0; }
         u64 outsize = getoutsize(buf);
         NacpLanguageEntry* langentry = NULL;
         if (outsize != 0) {
             if (!strcmp(argv[1], "icon")) {
-                u64 i;
-                for (i = 0; i < outsize - sizeof(buf->nacp); i++)
-                {
-                    printf("%02X", buf->icon[i]);
-                }
-                printf("\n");
+                if (outsize >= sizeof(buf->nacp) &&
+                    outsize - sizeof(buf->nacp) <= sizeof(buf->icon))
+                    read_wire_hex(stdout, (const uint8_t*)buf->icon, (size_t)(outsize - sizeof(buf->nacp)));
+                if (!ferror(stdout)) printf("\n");
             }
             if (!strcmp(argv[1], "version"))
             {
@@ -574,6 +573,7 @@ int argmain(int argc, char** argv)
         //errors with 0x668CE, unless debugunit flag is patched
         u64 bSize = 0x7D000;
         char* buf = malloc(bSize);
+        if (!buf) { printf("\n"); return 0; }
         u64 outSize = 0;
 
         Result rc = capsscCaptureForDebug(buf, bSize, &outSize);
@@ -581,8 +581,9 @@ int argmain(int argc, char** argv)
         if (R_FAILED(rc) && debugResultCodes)
             printf("capssc, 1204: %d\n", rc);
 
-        if (outSize <= bSize && read_wire_hex(stdout, (const uint8_t*)buf, (size_t)outSize) == 0)
-            printf("\n");
+        if (outSize <= bSize)
+            read_wire_hex(stdout, (const uint8_t*)buf, (size_t)outSize);
+        if (!ferror(stdout)) printf("\n");
 
         free(buf);
     }
@@ -699,6 +700,7 @@ int argmain(int argc, char** argv)
             }
 
             u64 thisCount = currIndex - lastIndex;
+            if (thisCount < 3 || itemCount >= 40) { printf("\n"); return 0; }
 
             s64 finalJump = parseStringToSignedLong(argv[currIndex - 1]);
             u64 size = parseStringToSignedLong(argv[lastIndex]);
@@ -709,7 +711,6 @@ int argmain(int argc, char** argv)
             u64 solved = followMainPointer(jumps, count);
             solved += finalJump;
 
-            if (itemCount >= 40) { printf("\n"); return 0; }
             offsets[itemCount] = solved;
             sizes[itemCount] = size;
             itemCount++;
