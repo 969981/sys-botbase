@@ -6,6 +6,8 @@
 #include <math.h>
 #include "commands.h"
 #include "util.h"
+#include "read_wire.h"
+#include <stdint.h>
 
 
 //Controller:
@@ -260,100 +262,164 @@ void writeMem(u64 offset, u64 size, u8* val)
         printf("svcWriteDebugProcessMemory: %d\n", rc);
 }
 
+/* Experimental Wi-Fi limits. No persistent debug handle across requests. */
+#define READ_MULTI_MAX_RANGES 512U
+#define READ_MULTI_MAX_BYTES (1024U * 1024U)
+
+typedef struct {
+    u64 ranges, bytes, calls, attach_ticks, read_ticks, output_ticks, detach_ticks, total_ticks;
+    bool ok;
+} ReadPerf;
+
+static bool readPerfEnabled = false;
+static bool readPerfAvailable = false;
+static ReadPerf lastReadPerf;
+static u64 inputTicks, dispatchTick;
+static u64 lastInputTicks, lastParseTicks;
+
+void configureReadPerf(bool enabled)
+{
+    readPerfEnabled = enabled;
+    readPerfAvailable = false;
+}
+
+void markReadPerfInput(u64 ticks, u64 dispatch)
+{
+    inputTicks = ticks;
+    dispatchTick = dispatch;
+}
+
+static u64 perfNow(void)
+{
+    return readPerfEnabled ? armGetSystemTick() : 0;
+}
+
+static void finishReadPerf(ReadPerf *p, u64 start, u64 parseTicks)
+{
+    if (!readPerfEnabled) return;
+    p->total_ticks = perfNow() - start;
+    lastReadPerf = *p;
+    lastInputTicks = inputTicks;
+    lastParseTicks = parseTicks;
+    readPerfAvailable = true;
+}
+
+void printReadPerf(void)
+{
+    if (!readPerfAvailable)
+    {
+        printf("readperf-v1 unavailable\n");
+        return;
+    }
+    const ReadPerf *p = &lastReadPerf;
+    printf("readperf-v1 ok=%d ranges=%llu bytes=%llu calls=%llu input_ticks=%llu parse_dispatch_ticks=%llu attach_ticks=%llu read_ticks=%llu output_ticks=%llu detach_ticks=%llu total_ticks=%llu\n",
+        p->ok, (unsigned long long)p->ranges, (unsigned long long)p->bytes,
+        (unsigned long long)p->calls, (unsigned long long)lastInputTicks,
+        (unsigned long long)lastParseTicks, (unsigned long long)p->attach_ticks,
+        (unsigned long long)p->read_ticks, (unsigned long long)p->output_ticks,
+        (unsigned long long)p->detach_ticks, (unsigned long long)p->total_ticks);
+}
+
 void peek(u64 offset, u64 size)
 {
-    u8* out = malloc(sizeof(u8) * size);
-    if (out == NULL) {
-        printf("\n");
-        return;
-    }
-    attach();
-    Result rc = readMem(out, offset, size);
-    if (R_FAILED(rc))
-    {
-        printf("\n");
-        detach();
-        free(out);
-        return;
-    }
-
-    u64 i;
-    for (i = 0; i < size; i++)
-    {
-        printf("%02X", out[i]);
-    }
-    printf("\n");
-    detach();
-    free(out);
+    // pointerPeek keeps the one-range response format.
+    peekMulti(&offset, &size, 1);
 }
 
 void peekInfinite(u64 offset, u64 size)
 {
-    u64 sizeRemainder = size;
-    u64 totalFetched = 0;
-    u64 i;
-    u8* out = malloc(sizeof(u8) * MAX_LINE_LENGTH);
-    if (out == NULL) {
-        printf("\n");
-        return;
-    }
+    u64 start = perfNow(), phase, parseTicks = readPerfEnabled ? start - dispatchTick : 0;
+    ReadPerf p = { .ranges = 1, .bytes = size };
+    u8 *out = NULL;
+    bool attached = false;
+    if (size && offset > UINT64_MAX - (size - 1)) goto done;
+    out = malloc(MAX_LINE_LENGTH);
+    if (!out) goto done;
 
+    phase = perfNow();
     attach();
-    while (sizeRemainder > 0)
+    attached = true;
+    p.attach_ticks += perfNow() - phase;
+    for (u64 fetched = 0; fetched < size; )
     {
-        u64 thisBuffersize = sizeRemainder > MAX_LINE_LENGTH ? MAX_LINE_LENGTH : sizeRemainder;
-        sizeRemainder -= thisBuffersize;
-        Result rc = readMem(out, offset + totalFetched, thisBuffersize);
-        if (R_FAILED(rc))
-        {
-            printf("\n");
-            detach();
-            free(out);
-            return;
-        }
-
-        for (i = 0; i < thisBuffersize; i++)
-        {
-            printf("%02X", out[i]);
-        }
-
-        totalFetched += thisBuffersize;
+        u64 remaining = size - fetched;
+        u64 chunk = remaining > MAX_LINE_LENGTH ? MAX_LINE_LENGTH : remaining;
+        phase = perfNow();
+        Result rc = readMem(out, offset + fetched, chunk);
+        p.calls++;
+        p.read_ticks += perfNow() - phase;
+        if (R_FAILED(rc)) goto done;
+        phase = perfNow();
+        int status = read_wire_hex(stdout, out, (size_t)chunk);
+        p.output_ticks += perfNow() - phase;
+        if (status != 0) goto done;
+        fetched += chunk;
     }
-    printf("\n");
-    detach();
+    p.ok = true;
+done:
+    if (attached)
+    {
+        phase = perfNow();
+        detach();
+        p.detach_ticks += perfNow() - phase;
+    }
+    phase = perfNow();
+    if (!ferror(stdout) && fputc('\n', stdout) == EOF) p.ok = false;
+    if (fflush(stdout) != 0 || ferror(stdout)) p.ok = false;
+    p.output_ticks += perfNow() - phase;
     free(out);
+    finishReadPerf(&p, start, parseTicks);
 }
 
 void peekMulti(u64* offset, u64* size, u64 count)
 {
-    u64 totalSize = 0;
-    for (int i = 0; i < count; i++)
-        totalSize += size[i];
-
-    u8* out = malloc(sizeof(u8) * totalSize);
-    u64 ofs = 0;
-    attach();
-    for (int i = 0; i < count; i++)
+    u64 start = perfNow(), phase, parseTicks = readPerfEnabled ? start - dispatchTick : 0;
+    ReadPerf p = { .ranges = count };
+    u8 *out = NULL;
+    bool attached = false;
+    u64 total = 0;
+    if (!count || count > READ_MULTI_MAX_RANGES) goto done;
+    for (u64 i = 0; i < count; ++i)
     {
+        if (!size[i] || size[i] > READ_MULTI_MAX_BYTES - total ||
+            offset[i] > UINT64_MAX - (size[i] - 1)) goto done;
+        total += size[i];
+    }
+    p.bytes = total;
+    out = malloc((size_t)total);
+    if (!out) goto done;
+
+    phase = perfNow();
+    attach();
+    attached = true;
+    p.attach_ticks += perfNow() - phase;
+    u64 ofs = 0;
+    for (u64 i = 0; i < count; ++i)
+    {
+        phase = perfNow();
         Result rc = readMem(out + ofs, offset[i], size[i]);
-        if (R_FAILED(rc))
-        {
-            printf("\n");
-            detach();
-            free(out);
-            return;
-        }
+        p.calls++;
+        p.read_ticks += perfNow() - phase;
+        if (R_FAILED(rc)) goto done;
         ofs += size[i];
     }
-
-    u64 i;
-    for (i = 0; i < totalSize; i++)
+    // Multi keeps all-or-nothing memory-read behavior and request order.
+    phase = perfNow();
+    p.ok = read_wire_hex(stdout, out, (size_t)total) == 0;
+    p.output_ticks += perfNow() - phase;
+done:
+    if (attached)
     {
-        printf("%02X", out[i]);
+        phase = perfNow();
+        detach();
+        p.detach_ticks += perfNow() - phase;
     }
-    printf("\n");
-    detach();
+    phase = perfNow();
+    if (!ferror(stdout) && fputc('\n', stdout) == EOF) p.ok = false;
+    if (fflush(stdout) != 0 || ferror(stdout)) p.ok = false;
+    p.output_ticks += perfNow() - phase;
     free(out);
+    finishReadPerf(&p, start, parseTicks);
 }
 
 Result readMem(u8* out, u64 offset, u64 size)
